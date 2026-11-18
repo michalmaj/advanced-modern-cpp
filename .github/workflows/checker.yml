@@ -155,7 +155,8 @@ jobs:
 
       - name: Check the exit codes
         run: |
-          set -uo pipefail
+          # The default shell runs with -e; these commands are expected to fail.
+          set +e -u
           expect() {
             want=$1; shift
             "$PY" -m tools.checker "$@" > "$RUNNER_TEMP/out.txt" 2>&1
