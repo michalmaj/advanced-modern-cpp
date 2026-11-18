@@ -68,7 +68,9 @@ def _cmd_compare(args) -> int:
 def _cmd_selftest(args) -> int:
     loader = unittest.TestLoader()
     if args.pattern:
-        loader.testNamePatterns = [args.pattern]
+        # Same rule as `python -m unittest -k`: plain text matches anywhere in the test name.
+        pattern = args.pattern if any(c in args.pattern for c in "*?[") else f"*{args.pattern}*"
+        loader.testNamePatterns = [pattern]
     suite = loader.discover(start_dir=str(REPO_ROOT / "tests" / "checker"), pattern="test_*.py",
                             top_level_dir=str(REPO_ROOT))
     outcome = unittest.TextTestRunner(verbosity=2 if args.verbose else 1, stream=sys.stdout).run(suite)
