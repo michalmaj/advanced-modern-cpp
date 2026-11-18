@@ -1,0 +1,5 @@
+{
+  "id": "spike_inventory",
+  "modes": ["compile", "run", "test"],
+  "targets": ["inventory_app", "inventory_checks"]
+}

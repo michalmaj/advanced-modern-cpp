@@ -1,0 +1,199 @@
+# Checker prototype: runs the checker's self-tests and its technical fixtures
+# on the three course platforms, then compares the stable part of the reports.
+#
+#   Ubuntu 24.04  LLVM clang++ 22 from apt.llvm.org, libstdc++ of the runner's GCC
+#   macOS         LLVM clang++ 22 from Homebrew llvm@22, libc++
+#   Windows       LLVM clang++ 22 (clang++ driver, MSVC ABI), MSVC STL
+#
+# On Windows the MSVC standard library and linker are used through clang++;
+# the MSVC compiler (cl.exe) is not used and not claimed to be supported.
+# This proves the checker on GitHub-hosted runners only; it says nothing
+# about a learner's computer.
+
+name: Checker
+
+on:
+  pull_request:
+    paths:
+      - 'tools/checker/**'
+      - 'tests/**'
+      - '.github/workflows/checker.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/checker/**'
+      - 'tests/**'
+      - '.github/workflows/checker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Exact LLVM release installed on Windows; Homebrew llvm@22 and apt.llvm.org clang-22
+  # provide the current 22.x release. The checker logs the version it uses.
+  LLVM_VERSION: '22.1.8'
+  LLVM_MAJOR: '22'
+  # A missing tool fails a self-test here instead of skipping it.
+  AMC_CHECKER_REQUIRE_TOOLCHAIN: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  platform:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            key: ubuntu
+            name: Ubuntu 24.04 / clang++ 22, libstdc++
+            python: python3
+          - os: macos-15
+            key: macos
+            name: macOS / clang++ 22, libc++
+            python: python3
+          - os: windows-2025
+            key: windows
+            name: Windows / clang++ 22 (MSVC ABI), MSVC STL
+            python: python
+    defaults:
+      run:
+        shell: bash
+    env:
+      PY: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install LLVM, CMake and Ninja (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-${LLVM_MAJOR} main" | sudo tee /etc/apt/sources.list.d/llvm-${LLVM_MAJOR}.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q "clang-${LLVM_MAJOR}" cmake ninja-build
+          { echo "CXX=/usr/bin/clang++-${LLVM_MAJOR}"; echo "CMAKE=/usr/bin/cmake"; echo "NINJA=/usr/bin/ninja"; } >> "$GITHUB_ENV"
+
+      - name: Install LLVM, CMake and Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install "llvm@${LLVM_MAJOR}" cmake ninja
+          prefix=$(brew --prefix "llvm@${LLVM_MAJOR}")
+          { echo "CXX=$prefix/bin/clang++"; echo "CMAKE=$(command -v cmake)"; echo "NINJA=$(command -v ninja)"; } >> "$GITHUB_ENV"
+
+      - name: Install LLVM (Windows; CMake and Ninja come with the image)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco upgrade llvm --version=$env:LLVM_VERSION --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CXX=C:\Program Files\LLVM\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE=$((Get-Command cmake).Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "NINJA=$((Get-Command ninja).Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Identify the environment
+        run: |
+          set -euo pipefail
+          echo "runner image: ${ImageOS:-?} ${ImageVersion:-?}, $(uname -m)"
+          "$PY" --version
+          "$CXX" --version
+          "$CMAKE" --version | head -1
+          echo "ninja $("$NINJA" --version)"
+          echo "git core.autocrlf: $(git config --get core.autocrlf || echo unset)"
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            "$CXX" -v -x c++ -E /dev/null -o /dev/null 2>&1 | grep -E 'Selected GCC' || true
+          fi
+          "$PY" -m tools.checker toolchain --cxx "$CXX" --cmake "$CMAKE" --ninja "$NINJA"
+
+      - name: Self-tests
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$PY" -m tools.checker selftest
+          echo "self-tests took $((SECONDS - start)) s"
+
+      - name: Lint the fixtures (markers, paths, projects, PL/EN pairs)
+        run: |
+          "$PY" -m tools.checker lint tests/checker/fixtures/lessons
+
+      - name: Check the Markdown and directory-project fixtures
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          "$PY" -m tools.checker check tests/checker/fixtures/lessons \
+            --cxx "$CXX" --cmake "$CMAKE" --ninja "$NINJA" \
+            --report "$RUNNER_TEMP/report-${{ matrix.key }}.json" \
+            --work-dir "$RUNNER_TEMP/amc-work" --keep-work --verbose
+          echo "fixture check took $((SECONDS - start)) s"
+
+      - name: Confirm that no unsafe example ran
+        run: |
+          "$PY" -I - "$RUNNER_TEMP/amc-work" <<'EOF'
+          import pathlib, sys
+          work = pathlib.Path(sys.argv[1])
+          hits = sorted(p.relative_to(work).as_posix() for p in work.rglob("SENTINEL-*"))
+          print("sentinel files:", hits or "none")
+          unsafe = ("dangling_return", "view_of_temporary", "sentinel_program")
+          bad = []
+          for folder in sorted(work.iterdir()):
+              if folder.name.endswith(unsafe):
+                  files = sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file())
+                  print(f"{folder.name}: {files}")
+                  if files != ["src/main.cpp"]:
+                      bad.append(folder.name)
+          sys.exit(1 if hits or bad else 0)
+          EOF
+
+      - name: Check the exit codes
+        run: |
+          set -uo pipefail
+          expect() {
+            want=$1; shift
+            "$PY" -m tools.checker "$@" > "$RUNNER_TEMP/out.txt" 2>&1
+            got=$?
+            echo "exit $got (expected $want): $*"
+            if [ "$got" != "$want" ]; then cat "$RUNNER_TEMP/out.txt"; exit 1; fi
+          }
+          expect 1 check tests/checker/cli_cases/content_failure --cxx "$CXX"
+          expect 2 check tests/checker/cli_cases/protocol_error --cxx "$CXX"
+          expect 3 check tests/checker/fixtures/lessons --cxx definitely-not-a-compiler
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: report-${{ matrix.key }}
+          path: ${{ runner.temp }}/report-${{ matrix.key }}.json
+          if-no-files-found: error
+
+  compare:
+    name: Compare the reports of the three platforms
+    needs: platform
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: report-*
+          merge-multiple: true
+          path: reports
+      - name: Compare the stable fields
+        run: |
+          python3 -m tools.checker compare reports/report-ubuntu.json reports/report-macos.json reports/report-windows.json
+          python3 -I - <<'EOF'
+          import json
+          for key in ("ubuntu", "macos", "windows"):
+              data = json.load(open(f"reports/report-{key}.json"))
+              env = data["environment"]
+              print(f"{key}: clang {env.get('clang_version')} {env.get('target')}, {env.get('stdlib')}, "
+                    f"cmake {env.get('cmake_version')}, ninja {env.get('ninja_version')}, "
+                    f"python {env.get('python')}, lesson line ends {env.get('lesson_line_ends')}")
+          EOF
