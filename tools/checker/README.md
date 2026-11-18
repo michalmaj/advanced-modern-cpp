@@ -52,15 +52,15 @@ separated by single spaces, and attributes appear only in the order shown.
 
 | Marker | Block | Meaning |
 |---|---|---|
-| `<!-- run: NAME [exit=N] [source=PATH] -->` | `cpp` | Build with the strict flags, run once per `output` block, compare stdout. |
+| `<!-- run: NAME [exit=N] [source=PATH] [data=DIR] -->` | `cpp` | Build with the strict flags, run once per `output` block, compare stdout. |
 | `<!-- input: NAME -->` | `text` | Standard input of the next run of NAME. |
-| `<!-- output: NAME -->` | `text` | Exact expected stdout of one run of NAME. |
+| `<!-- output: NAME [in=FILE] -->` | `text` | Exact expected stdout of one run of NAME; `in=` gives that run's standard input from a file. |
 | `<!-- compile: NAME [source=PATH] -->` | `cpp` | Build and link with the strict flags; never run. |
-| `<!-- test: NAME [source=PATH] -->` | `cpp` | Build a check program and run it: exit code 0 and empty stderr pass; stdout is only logged. |
+| `<!-- test: NAME [source=PATH] [data=DIR] [against=PATH] -->` | `cpp` | Build a check program and run it: exit code 0 and empty stderr pass; stdout is only logged. `against=` also requires it to reject a faulty implementation. |
 | `<!-- compile_fail: NAME at=LINE[:COL] error=REGEX -->` | `cpp` | Must fail to compile with a real error at that place in `main.cpp`. |
 | `<!-- compile_unsafe: NAME [allow=-WFLAG@LINE,...] -->` | `cpp` | Static check only (`-fsyntax-only`): never linked, never run. |
 | `<!-- file: NAME PATH [source=PATH] -->` | `cpp` | Another file of program NAME (a flat `.cpp` or `.hpp` name), or a file shown from project NAME. |
-| `<!-- project: NAME dir=PATH mode=compile\|run\|test [target=T] [exit=N] -->` | none | A directory project; `mode=run` takes `output` blocks. |
+| `<!-- project: NAME dir=PATH mode=compile\|run\|test [target=T] [exit=N] [data=DIR] -->` | none | A directory project; `mode=run` takes `output` blocks. |
 | `<!-- fragment -->` | `cpp` | Deliberately incomplete code; never compiled. |
 
 - **NAME** uses lowercase letters, digits and `_`, and is unique in its lesson.
@@ -125,9 +125,79 @@ For code that compiles but illustrates undefined or unsafe behaviour.
 - **Shown files:** a `file:` block with the project's NAME shows a project file; its PATH is relative to the project folder, and its content must equal that file.
 - **Not a sandbox:** projects are reviewed material of this repository, not a safe place to run untrusted code.
 
+## Standard input from a file (`in=`)
+
+Each `output` block is one run, one control case. Its standard input
+comes from exactly one place:
+
+- the `input` block directly before it;
+- the file named by `in=` on the `output` marker;
+- or nothing (closed standard input).
+
+An `input` block together with `in=` for the same run is a protocol error
+(`input_conflict`).
+
+```markdown
+<!-- run: sum_numbers -->              (the program)
+<!-- input: sum_numbers -->            case 1: inline data
+<!-- output: sum_numbers -->
+<!-- output: sum_numbers in=tests/checker/fixtures/data/stdin/numbers.txt -->   case 2: data from a file
+```
+
+The file is passed byte for byte. `in=` exists only on `output` markers,
+which only `run` programs and projects with `mode=run` accept, so it cannot
+start a `compile_unsafe` example.
+
+## Data folders (`data=`)
+
+`data=DIR` on a `run` or `test` program, or on a project with `mode=run`
+or `mode=test`, names a folder in the repository.
+
+- **Contract:** every run starts in a new, empty working folder that holds a copy of the folder's files. The program opens them by their names, for example `std::ifstream file{"readings.txt"}`.
+- **What the program never sees:**
+  - the original folder;
+  - the repository;
+  - the project's source or build folder.
+- **Changes stay in the copy:** a program may change its copy; the next run gets a fresh one.
+- **Originals are fingerprinted:** the checker takes SHA-256 fingerprints of the original data files and `in=` files before and after the runs. Any change is a failure (`source_modified`).
+- **Byte for byte:** data files are not normalised. Keep Git from converting their line ends with a `.gitattributes` entry such as `data/** -text`, as `tests/checker/fixtures/.gitattributes` does. Every system then gets the same bytes, including files that are meant to have CRLF line ends.
+- **Refused folders:** a data folder may not be a whole allowed root, may not contain symbolic links, and may hold at most 100 files and 4 MiB.
+- **Only for programs that run:** `data=` is a protocol error on `compile`, `compile_fail` and `compile_unsafe`, and on projects with `mode=compile`.
+
+## Checking that a test catches a fault (`against=`)
+
+`against=PATH` on a `test` program names a deliberately faulty version of
+one of the program's `file:` blocks, with the same file name. For example,
+`against=.../negative_accepted/parse_count.cpp` replaces `parse_count.cpp`.
+
+The faulty file must exist, must be ASCII, and must differ from the correct
+file.
+
+Besides the usual `NAME/build` and `NAME/test` verdicts, the program gets
+one more verdict, `NAME/against`. It passes only when every step holds:
+
+1. the check program builds and passes with the correct implementation;
+2. it builds and links with the faulty file in place of the correct one;
+3. it runs to the end;
+4. it rejects the faulty implementation with the agreed report.
+
+**The agreed report of failed checks** is:
+
+- exit code 1;
+- at least one stdout line that starts with `FAIL `;
+- empty stderr.
+
+| Category of a failed `NAME/against` | Meaning |
+|---|---|
+| `correct_failed` | the check program does not pass with the correct implementation |
+| `faulty_build_failed` | the faulty file does not compile or link (not a detected fault) |
+| `faulty_timeout`, `faulty_crashed`, `faulty_output_limit` | the check program hung, crashed or printed too much (not a detected fault) |
+| `faulty_not_detected` | the check program passes with the faulty implementation too |
+| `faulty_unrecognized` | it failed, but not with the agreed report (another exit code, no `FAIL ` line, or output on stderr) |
+
 ## Paths
 
-Paths in markers (`source=`, `dir=`) are relative to the repository root
+Paths in markers (`source=`, `dir=`, `in=`, `data=`, `against=`) are relative to the repository root
 and use `/`. Allowed roots are `course`, `projects`, `exercises`, `support`
 and `tests/checker/fixtures`. The checker refuses:
 
@@ -155,7 +225,7 @@ Both files of a PL/EN pair may point to the same `source=` file or project.
   - on a timeout or when a stream goes over the output limit, the whole group is stopped (`killpg` on POSIX, `taskkill /T /F` on Windows);
   - output is read while the program runs.
 - **Work folders:**
-  - examples run in their own empty folder inside the work folder;
+  - every run starts in its own new folder inside the work folder, with a copy of the `data=` folder if one is declared;
   - the work folder is a new temporary folder by default; it may also be outside the repository or under `build/`, never elsewhere in the sources.
 - **Environment:** started examples get a small environment (`PATH`, on Windows also `SYSTEMROOT`, `WINDIR`, `TEMP`, `TMP`) with `LC_ALL=C` and `TZ=UTC`, and closed or given standard input.
 - **Commands:** commands are fixed argument lists (no shell); nothing written in the prose of a lesson is executed.
@@ -178,7 +248,7 @@ The stable fields of a verdict are `id`, `source`, `mode`, `expected`,
 reports. `actual`, `detail` and `duration_ms` differ between systems and are
 not compared.
 
-Verdict ids are `LESSON#NAME/build`, `/run1`, `/test`, `/configure`, or
+Verdict ids are `LESSON#NAME/build`, `/run1`, `/test`, `/against`, `/configure`, `/data` (only when an original data file changed), or
 `LESSON#NAME` for `compile_fail` and `compile_unsafe`. Protocol errors use
 `LESSON:LINE:CATEGORY`.
 
@@ -187,7 +257,7 @@ Verdict ids are `LESSON#NAME/build`, `/run1`, `/test`, `/configure`, or
 - `diagnostic`, `concurrent`, `benchmark` modes;
 - `compile_fail` in a file other than `main.cpp`;
 - link-stage failures;
-- data files for runs;
+- `against=` for directory projects;
 - CTest-based project checks;
 - comparison of the lesson structure (sections) between PL and EN;
 - sharding.

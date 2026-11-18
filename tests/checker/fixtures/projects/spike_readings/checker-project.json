@@ -1,0 +1,5 @@
+{
+  "id": "spike_readings",
+  "modes": ["run", "test"],
+  "targets": ["readings_app", "readings_checks"]
+}

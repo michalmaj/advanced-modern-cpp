@@ -52,3 +52,40 @@ class PairingTests(CheckerTest):
         result = self.lint_files({"course/a.md": LESSON, "course/a.en.md": changed})
         self.assertEqual(result.summary["lesson_pairs_checked"], 0)
         self.assertEqual(result.summary["lessons_blocked_by_protocol_errors"], 1)
+
+
+class NewAttributePairingTests(CheckerTest):
+    """in=, data= and against= are part of the marker line, so PL and EN must agree on them."""
+
+    FILES = {"support/a.txt": "1\n", "support/b.txt": "2\n", "support/d1/x.txt": "x\n", "support/d2/x.txt": "y\n",
+             "support/f1/h.cpp": "int h() {\n    return 1;\n}\n", "support/f2/h.cpp": "int h() {\n    return 2;\n}\n"}
+
+    def lesson(self, first="support/a.txt", second="support/b.txt", data="support/d1", against="support/f1/h.cpp"):
+        program = "int main() {\n    return 0;\n}\n"
+        return (code(f"<!-- run: demo data={data} -->", program)
+                + code(f"<!-- output: demo in={first} -->", "", "text")
+                + code(f"<!-- output: demo in={second} -->", "", "text")
+                + code(f"<!-- test: checks against={against} -->", program)
+                + code("<!-- file: checks h.cpp -->", "int h() {\n    return 0;\n}\n"))
+
+    def test_matching_new_attributes_pass(self):
+        self.assertClean(self.lint(self.make_repo({"course/a.md": self.lesson(), "course/a.en.md": self.lesson(),
+                                                   **self.FILES})))
+
+    def test_differences_in_new_attributes(self):
+        variants = {
+            "in=": self.lesson(first="support/b.txt", second="support/b.txt"),
+            "order of cases": self.lesson(first="support/b.txt", second="support/a.txt"),
+            "data=": self.lesson(data="support/d2"),
+            "against=": self.lesson(against="support/f2/h.cpp"),
+        }
+        for name, english in variants.items():
+            with self.subTest(difference=name):
+                result = self.lint(self.make_repo({"course/a.md": self.lesson(), "course/a.en.md": english,
+                                                   **self.FILES}))
+                self.assertProtocol(result, "pairing_mismatch")
+
+    def test_crlf_lesson_with_new_attributes(self):
+        crlf = self.lesson().replace("\n", "\r\n").encode("utf-8")
+        self.assertClean(self.lint(self.make_repo({"course/a.md": self.lesson(), "course/a.en.md": crlf,
+                                                   **self.FILES})))

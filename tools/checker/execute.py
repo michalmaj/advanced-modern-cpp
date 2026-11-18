@@ -15,6 +15,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from .datafiles import fingerprint, fresh_run_folder, run_input
 from .diagnostics import compiler_crashed, parse
 from .model import EXECUTED_KINDS, UNSAFE_KINDS, GuardViolation, Status, Verdict
 from .proc import run_process
@@ -97,15 +98,33 @@ def verdict(vid, rel, mode, expected, status, category="", actual="", detail="",
                    category=category, actual=actual, detail=detail, duration_ms=duration)
 
 
-def write_program(program, src: Path) -> list:
+def write_program(program, src: Path, replace: dict | None = None) -> list:
+    """Write main.cpp and the program's files; REPLACE maps file names to other contents."""
+    replace = replace or {}
     src.mkdir(parents=True, exist_ok=True)
     (src / "main.cpp").write_bytes(program.main.content.encode("ascii"))
     sources = ["main.cpp"]
     for path, block in program.files:
-        (src / path).write_bytes(block.content.encode("ascii"))
+        (src / path).write_bytes(replace.get(path, block.content).encode("ascii"))
         if path.endswith(".cpp"):
             sources.append(path)
     return sources
+
+
+def _originals(owner) -> list:
+    return [owner.data_root] + [run.stdin_path for run in owner.runs]
+
+
+def check_originals(rel: str, base: str, mode: str, before: dict, owner) -> list:
+    """A FAIL verdict when a run changed a data file of the repository; [] otherwise."""
+    after = fingerprint(_originals(owner))
+    if after == before:
+        return []
+    changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+    return [verdict(f"{base}/data", rel, mode, "data files in the repository stay unchanged",
+                    Status.FAIL, "source_modified",
+                    f"a run changed {len(changed)} original data file(s) outside its working copy",
+                    ", ".join(Path(c).name for c in changed))]
 
 
 def tool_problem(result, what: str, timeout: float, ctx: Context):
@@ -138,13 +157,12 @@ def first_difference(actual: str, expected: str) -> str:
     return f"got {len(a)} line(s), expected {len(b)}"
 
 
-def execute_binary(kind: str, ctx: Context, exe: Path, cwd: Path, stdin):
+def execute_binary(kind: str, ctx: Context, exe: Path, cwd: Path, stdin: bytes | None):
     """The only place where an example is started."""
     if kind not in EXECUTED_KINDS or kind in UNSAFE_KINDS:
         raise GuardViolation(f"refusing to start a program of kind '{kind}'")
     return run_process([str(exe)], cwd=cwd, env=example_env(), timeout=ctx.settings.run_timeout,
-                       stdin=stdin.encode("ascii") if stdin is not None else None,
-                       limit=ctx.settings.output_limit)
+                       stdin=stdin, limit=ctx.settings.output_limit)
 
 
 def check_started(ctx: Context, vid: str, rel: str, mode: str, result, expected_exit: int,
@@ -187,11 +205,8 @@ def check_started(ctx: Context, vid: str, rel: str, mode: str, result, expected_
 
 def _build_markdown(ctx: Context, lesson, program, ex: Path):
     """Compile and link a Markdown program with the strict flags. Returns (verdict, exe)."""
-    sources = write_program(program, ex / "src")
     exe = ex / ("program" + EXE)
-    argv = ctx.toolchain.cxx + STD + STRICT + DIAGNOSTIC_FORMAT + sources + ["-o", str(exe)]
-    result = run_process(argv, cwd=ex / "src", env=None, timeout=ctx.settings.compile_timeout,
-                         limit=TOOL_OUTPUT_LIMIT)
+    result = _compile_and_link(ctx, program, ex / "src", exe)
     vid = f"{lesson.rel}#{program.name}/build"
     expected = "compiles and links with -Wall -Wextra -Wpedantic -Werror"
     problem = tool_problem(result, "the compiler", ctx.settings.compile_timeout, ctx)
@@ -207,6 +222,12 @@ def _build_markdown(ctx: Context, lesson, program, ex: Path):
                    duration=result.duration_ms), exe
 
 
+def _compile_and_link(ctx: Context, program, src: Path, exe: Path, replace: dict | None = None):
+    sources = write_program(program, src, replace)
+    argv = ctx.toolchain.cxx + STD + STRICT + DIAGNOSTIC_FORMAT + sources + ["-o", str(exe)]
+    return run_process(argv, cwd=src, env=None, timeout=ctx.settings.compile_timeout, limit=TOOL_OUTPUT_LIMIT)
+
+
 def check_run(ctx: Context, lesson, program) -> list:
     if program.kind != "run":
         raise GuardViolation(f"check_run called for kind '{program.kind}'")
@@ -215,13 +236,14 @@ def check_run(ctx: Context, lesson, program) -> list:
     found = [build]
     if exe is None:
         return found
-    cwd = ex / "run"
-    cwd.mkdir()
     expected_exit = int(program.marker.attrs.get("exit", "0"))
+    before = fingerprint(_originals(program))
     for run in program.runs:
-        result = execute_binary("run", ctx, exe, cwd, run.stdin)
+        cwd = fresh_run_folder(ex, f"run{run.index}", program.data_root)
+        result = execute_binary("run", ctx, exe, cwd, run_input(run))
         found.append(check_started(ctx, f"{lesson.rel}#{program.name}/run{run.index}", lesson.rel,
                                    "run", result, expected_exit, run.expected))
+    found.extend(check_originals(lesson.rel, f"{lesson.rel}#{program.name}", "run", before, program))
     return found
 
 
@@ -230,12 +252,73 @@ def check_test(ctx: Context, lesson, program) -> list:
         raise GuardViolation(f"check_test called for kind '{program.kind}'")
     ex = example_dir(ctx, lesson.rel, program.name)
     build, exe = _build_markdown(ctx, lesson, program, ex)
-    if exe is None:
-        return [build]
-    cwd = ex / "run"
-    cwd.mkdir()
-    result = execute_binary("test", ctx, exe, cwd, None)
-    return [build, check_started(ctx, f"{lesson.rel}#{program.name}/test", lesson.rel, "test", result, 0, None)]
+    found = [build]
+    correct = None
+    before = fingerprint(_originals(program))
+    if exe is not None:
+        cwd = fresh_run_folder(ex, "test", program.data_root)
+        result = execute_binary("test", ctx, exe, cwd, None)
+        correct = check_started(ctx, f"{lesson.rel}#{program.name}/test", lesson.rel, "test", result, 0, None)
+        found.append(correct)
+    if program.against_path is not None:
+        found.append(check_against(ctx, lesson, program, ex, correct))
+    found.extend(check_originals(lesson.rel, f"{lesson.rel}#{program.name}", "test", before, program))
+    return found
+
+
+# A check program reports failed checks with lines starting with "FAIL " and exit code 1.
+_FAIL_LINE = re.compile(r"^FAIL(?: |$)", re.MULTILINE)
+REJECTION_EXIT = 1
+
+
+def check_against(ctx: Context, lesson, program, ex: Path, correct) -> Verdict:
+    """Does the check program reject the faulty implementation named by against=?"""
+    s = ctx.settings
+    rel = lesson.rel
+    vid = f"{rel}#{program.name}/against"
+    expected = (f"with {program.marker.attrs['against']} in place of {program.against_target}: builds, runs and "
+                f"is rejected (exit code {REJECTION_EXIT}, a 'FAIL ' line on stdout, empty stderr)")
+    if correct is None or correct.status is not Status.PASS:
+        return verdict(vid, rel, "test", expected, Status.FAIL, "correct_failed",
+                       "the check program does not build or pass with the correct implementation, "
+                       "so its rejection of the faulty one cannot be judged")
+    folder = ex / "against"
+    exe = folder / ("program" + EXE)
+    faulty = program.against_path.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    result = _compile_and_link(ctx, program, folder / "src", exe, {program.against_target: faulty})
+    problem = tool_problem(result, "the compiler", s.compile_timeout, ctx)
+    if problem:
+        return verdict(vid, rel, "test", expected, Status.ENV_ERROR, *problem, duration=result.duration_ms)
+    if result.returncode != 0 or not exe.is_file():
+        return verdict(vid, rel, "test", expected, Status.FAIL, "faulty_build_failed",
+                       "the faulty implementation does not build, so the check program never ran against it "
+                       "(a build failure is not a detected fault)",
+                       shorten(decode(result.stdout + result.stderr), s.log_limit), result.duration_ms)
+    cwd = fresh_run_folder(folder, "test", program.data_root)
+    run = execute_binary("test", ctx, exe, cwd, None)
+    if not run.started:
+        return verdict(vid, rel, "test", expected, Status.ENV_ERROR, "start_failed",
+                       f"the check program could not be started: {run.error}")
+    out, err = decode(run.stdout), decode(run.stderr)
+    detail = shorten(out + (f"\n[stderr]\n{err}" if err else ""), s.log_limit)
+    if run.overflow:
+        category, actual = "faulty_output_limit", f"{run.overflow} exceeded the {s.output_limit}-byte limit"
+    elif run.timed_out:
+        category, actual = "faulty_timeout", f"did not finish within {s.run_timeout:g} s (a hang is not a detected fault)"
+    elif crash_description(run.returncode):
+        category, actual = "faulty_crashed", f"the check program {crash_description(run.returncode)} (a crash is not a detected fault)"
+    elif run.returncode == 0:
+        category, actual = "faulty_not_detected", "the check program passes on the faulty implementation too"
+    elif run.returncode == REJECTION_EXIT and not err and _FAIL_LINE.search(out):
+        lines = len(_FAIL_LINE.findall(out))
+        return verdict(vid, rel, "test", expected, Status.PASS,
+                       actual=f"rejected with exit code {REJECTION_EXIT} and {lines} FAIL line(s)",
+                       detail=detail, duration=run.duration_ms)
+    else:
+        category = "faulty_unrecognized"
+        actual = (f"exit code {run.returncode}, {'a' if _FAIL_LINE.search(out) else 'no'} FAIL line, "
+                  f"{'non-empty' if err else 'empty'} stderr: not the agreed report of failed checks")
+    return verdict(vid, rel, "test", expected, Status.FAIL, category, actual, detail, run.duration_ms)
 
 
 def check_compile(ctx: Context, lesson, program) -> list:
@@ -428,13 +511,17 @@ def check_project(ctx: Context, lesson, ref) -> list:
         found.append(verdict(f"{base}/{ref.mode}", lesson.rel, mode, f"one executable '{ref.target}'",
                              Status.FAIL, "missing_executable", f"no single executable '{ref.target}{EXE}' in the build folder"))
         return found
-    cwd = ex / "run"
-    cwd.mkdir()
+    # The program runs in its own folder holding a copy of data=, never in the build or source folder.
+    before = fingerprint(_originals(ref))
     if ref.mode == "test":
+        cwd = fresh_run_folder(ex, "test", ref.data_root)
         result = execute_binary("test", ctx, exe, cwd, None)
         found.append(check_started(ctx, f"{base}/test", lesson.rel, mode, result, 0, None))
-        return found
-    for run in ref.runs:
-        result = execute_binary("run", ctx, exe, cwd, run.stdin)
-        found.append(check_started(ctx, f"{base}/run{run.index}", lesson.rel, mode, result, ref.exit, run.expected))
+    else:
+        for run in ref.runs:
+            cwd = fresh_run_folder(ex, f"run{run.index}", ref.data_root)
+            result = execute_binary("run", ctx, exe, cwd, run_input(run))
+            found.append(check_started(ctx, f"{base}/run{run.index}", lesson.rel, mode, result, ref.exit,
+                                       run.expected))
+    found.extend(check_originals(lesson.rel, base, mode, before, ref))
     return found
