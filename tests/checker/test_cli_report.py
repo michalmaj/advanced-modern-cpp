@@ -4,6 +4,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,8 @@ from unittest import mock
 from tests.checker.helpers import REPO, CheckerTest
 from tools.checker import cli
 from tools.checker.engine import run_check
+from tools.checker.execute import Settings
+from tools.checker.model import STABLE_FIELDS
 from tools.checker.report import compare, make_report, write_report
 
 FIXTURES = "tests/checker/fixtures/lessons"
@@ -56,6 +59,21 @@ class ReportTests(CheckerTest):
         self.assertEqual(first["exit_code"], 0)
         ids = [v["id"] for v in first["verdicts"]]
         self.assertEqual(len(ids), len(set(ids)), "verdict ids must be unique")
+
+    def test_stable_fields_hold_no_environment_values(self):
+        # A tool version or a path in a stable field would make reports of different systems differ.
+        tool = self.need_toolchain()
+        self.need_build_tools()
+        report = make_report(run_check([FIXTURES], REPO, toolchain=tool, settings=Settings(
+            cmake=os.environ.get("CMAKE", "cmake"), ninja=os.environ.get("NINJA", "ninja"))))
+        env = report["environment"]
+        values = [str(env[key]) for key in ("clang_version", "target", "stdlib", "cmake_version",
+                                             "ninja_version", "cxx", "cmake", "ninja") if env.get(key)]
+        self.assertIn("cmake_version", env, "the fixtures include a directory project")
+        for verdict in report["verdicts"]:
+            for field in STABLE_FIELDS:
+                for value in values:
+                    self.assertNotIn(value, str(verdict[field]), f"{verdict['id']}: {field} contains {value!r}")
 
     def test_report_file_is_sorted_json(self):
         result = run_check([FIXTURES], REPO, build=False)

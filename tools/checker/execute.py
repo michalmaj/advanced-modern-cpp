@@ -381,7 +381,8 @@ def check_project(ctx: Context, lesson, ref) -> list:
                         Status.ENV_ERROR, exc.category, exc.message)]
     src, build = ex / "src", ex / "build"
     shutil.copytree(ref.root, src, ignore=shutil.ignore_patterns("build", "build-*", "cmake-build-*", ".git"))
-    expected = f"configures with CMake {tools.cmake_version} and Ninja using the checked clang++"
+    # Stable field: no tool versions here, they differ between systems.
+    expected = "configures with CMake and Ninja using the checked clang++"
     argv = [tools.cmake, "-S", str(src), "-B", str(build), "-G", "Ninja",
             f"-DCMAKE_MAKE_PROGRAM={tools.ninja}", "-DCMAKE_BUILD_TYPE=Debug",
             f"-DCMAKE_CXX_COMPILER={ctx.toolchain.cxx[0]}",
@@ -402,7 +403,8 @@ def check_project(ctx: Context, lesson, ref) -> list:
     if not ident or ident.group(1) != "Clang" or int(ident.group(2)) < s.min_clang:
         return [verdict(vid, lesson.rel, mode, expected, Status.ENV_ERROR, "wrong_compiler",
                         f"CMake did not select Clang {s.min_clang} or newer", shorten(text, s.log_limit))]
-    found = [verdict(vid, lesson.rel, mode, expected, Status.PASS, actual=f"configured with Clang {ident.group(2)}",
+    found = [verdict(vid, lesson.rel, mode, expected, Status.PASS,
+                     actual=f"configured with CMake {tools.cmake_version} and Clang {ident.group(2)}",
                      duration=result.duration_ms)]
     argv = [tools.cmake, "--build", str(build)]
     if ref.mode in ("run", "test"):
