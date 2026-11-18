@@ -107,9 +107,11 @@ class MarkedBlock:
 @dataclass
 class Run:
     index: int
-    stdin: str | None
+    stdin: str | None          # from an `input` block, normalised text
     expected: str
     line: int
+    stdin_file: str = ""       # `in=` on the `output` marker (repository path)
+    stdin_path: Path | None = None
 
 
 @dataclass
@@ -120,6 +122,9 @@ class Program:
     main: Block
     files: list = field(default_factory=list)   # [(path, Block)]
     runs: list = field(default_factory=list)    # [Run]
+    data_root: Path | None = None               # `data=` folder, copied into each run folder
+    against_path: Path | None = None            # `against=` faulty file
+    against_target: str = ""                    # the program file that the faulty file replaces
 
 
 @dataclass
@@ -134,6 +139,7 @@ class ProjectRef:
     files: list = field(default_factory=list)   # [(path, Block)] shown in the lesson
     manifest: dict = field(default_factory=dict)
     root: Path | None = None
+    data_root: Path | None = None
 
 
 @dataclass

@@ -20,6 +20,7 @@ from .model import (
     KNOWN_KINDS, PROGRAM_KINDS, PROJECT_MODES, RESERVED_KINDS,
     Block, Lesson, MarkedBlock, Marker, Program, ProjectRef, ProtocolIssue, Run, Status, Verdict,
 )
+from .datafiles import validate_data_dir, validate_input_file
 from .paths import check_relative, resolve_repo_path
 
 _CANONICAL = re.compile(r"<!-- ([a-z_]+): (.+?) -->\Z")
@@ -43,14 +44,14 @@ _LANG = {
 }
 # Optional attributes of each kind, in their only allowed order.
 _OPTIONAL = {
-    "run": ("exit", "source"),
+    "run": ("exit", "source", "data"),
     "compile": ("source",),
-    "test": ("source",),
+    "test": ("source", "data", "against"),
     "compile_unsafe": ("allow",),
     "file": ("source",),
     "input": (),
-    "output": (),
-    "project": ("target", "exit"),
+    "output": ("in",),
+    "project": ("target", "exit", "data"),
 }
 
 
@@ -292,13 +293,33 @@ def assemble(lesson: Lesson, repo_root: Path, allowed_roots) -> None:
                 waiting_input[mk.name] = item
             else:
                 given = waiting_input.pop(mk.name, None)
-                owner.runs.append(Run(len(owner.runs) + 1, given.block.content if given else None,
-                                      item.block.content, mk.line))
+                run = Run(len(owner.runs) + 1, given.block.content if given else None, item.block.content, mk.line)
+                stdin_file = mk.attrs.get("in", "")
+                if stdin_file:
+                    if given is not None:
+                        issue(mk, "input_conflict", f"run {run.index} of '{mk.name}' has an input block and in=; "
+                                                    "standard input comes from exactly one of them")
+                        continue
+                    try:
+                        run.stdin_path = validate_input_file(repo_root, stdin_file, allowed_roots)
+                    except ProtocolIssue as exc:
+                        issue(mk, exc.category, exc.message)
+                        continue
+                    run.stdin_file = stdin_file
+                owner.runs.append(run)
     for item in waiting_input.values():
         issue(item.marker, "missing_output", f"input block for '{item.marker.name}' is not followed by an output block")
 
     for owner in lesson.owners:
         mk = owner.marker
+        data = mk.attrs.get("data")
+        if data:
+            try:
+                owner.data_root = validate_data_dir(repo_root, data, allowed_roots)
+            except ProtocolIssue as exc:
+                issue(mk, exc.category, exc.message)
+        if isinstance(owner, Program) and "against" in mk.attrs:
+            _check_against(owner, repo_root, allowed_roots, issue)
         if isinstance(owner, Program):
             if owner.kind == "run" and not owner.runs:
                 issue(mk, "missing_output", f"run program '{owner.name}' needs at least one output block")
@@ -309,6 +330,8 @@ def assemble(lesson: Lesson, repo_root: Path, allowed_roots) -> None:
                 issue(mk, "missing_target", f"project '{owner.name}' in mode={owner.mode} needs target=")
             if owner.mode != "run" and "exit" in mk.attrs:
                 issue(mk, "bad_attribute", "exit= is only used with mode=run")
+            if owner.mode == "compile" and data:
+                issue(mk, "bad_attribute", "data= is only used with mode=run or mode=test")
 
     for item in lesson.marked:
         if item.block is not None and not item.block.content.isascii():
@@ -323,6 +346,33 @@ def assemble(lesson: Lesson, repo_root: Path, allowed_roots) -> None:
                 continue
             if expected != item.block.content:
                 issue(item.marker, "source_mismatch", f"the block differs from {source}")
+
+
+def _check_against(program: Program, repo_root: Path, allowed_roots, issue) -> None:
+    """`against=PATH`: a faulty version of one of the program's files, with the same file name."""
+    mk = program.marker
+    rel = mk.attrs["against"]
+    target = rel.rsplit("/", 1)[-1]
+    files = {path: block for path, block in program.files}
+    if target not in files:
+        issue(mk, "against_target_missing",
+              f"against={rel} must replace a file of '{program.name}' with the same name; "
+              f"its files are: {', '.join(sorted(files)) or 'none besides main.cpp'}")
+        return
+    try:
+        path = resolve_repo_path(repo_root, rel, allowed_roots, "against", "file")
+        content, _ = read_text(path)
+    except ProtocolIssue as exc:
+        issue(mk, exc.category, exc.message)
+        return
+    if not content.isascii():
+        issue(mk, "non_ascii", f"{rel} must be ASCII, like every program file")
+        return
+    if content == files[target].content:
+        issue(mk, "against_identical", f"{rel} is identical to the correct {target}, so it proves nothing")
+        return
+    program.against_path = path
+    program.against_target = target
 
 
 def load_lesson(path: Path, repo_root: Path, allowed_roots) -> Lesson:

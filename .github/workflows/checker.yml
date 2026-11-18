@@ -114,6 +114,17 @@ jobs:
           fi
           "$PY" -m tools.checker toolchain --cxx "$CXX" --cmake "$CMAKE" --ninja "$NINJA"
 
+      - name: Confirm that data files are checked out byte for byte
+        run: |
+          "$PY" -I - <<'EOF'
+          import pathlib, sys
+          data = pathlib.Path("tests/checker/fixtures/data/readings")
+          crlf = (data / "crlf.txt").read_bytes()
+          plain = (data / "readings.txt").read_bytes()
+          print(f"crlf.txt: {crlf!r}; readings.txt: {plain!r}")
+          sys.exit(0 if crlf == b"5\r\n7\r\n" and plain == b"12\n30\n8\n" else 1)
+          EOF
+
       - name: Self-tests
         run: |
           set -euo pipefail
@@ -167,6 +178,16 @@ jobs:
           expect 1 check tests/checker/cli_cases/content_failure --cxx "$CXX"
           expect 2 check tests/checker/cli_cases/protocol_error --cxx "$CXX"
           expect 3 check tests/checker/fixtures/lessons --cxx definitely-not-a-compiler
+          expect 1 check tests/checker/cli_cases/undetected_fault --cxx "$CXX"
+          if ! grep -q 'faulty_not_detected' "$RUNNER_TEMP/out.txt"; then
+            echo "expected the category faulty_not_detected"; cat "$RUNNER_TEMP/out.txt"; exit 1
+          fi
+
+      - name: Confirm that the checks left the sources unchanged
+        run: |
+          changes=$(git status --porcelain --untracked-files=all)
+          if [ -n "$changes" ]; then echo "$changes"; exit 1; fi
+          echo "working tree unchanged"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:

@@ -1,0 +1,32 @@
+// Deliberately faulty: negative counts are accepted.
+#include "parse_count.hpp"
+
+#include <sstream>
+
+ParseStatus parse_count(const std::string& text, int& count) {
+    if (text.empty()) {
+        return ParseStatus::empty;
+    }
+    std::istringstream stream{text};
+    int value{0};
+    char rest{};
+    if (!(stream >> value) || (stream >> rest)) {
+        return ParseStatus::not_a_number;
+    }
+    count = value;
+    return ParseStatus::ok;
+}
+
+std::string describe(ParseStatus status) {
+    switch (status) {
+    case ParseStatus::ok:
+        return "accepted";
+    case ParseStatus::empty:
+        return "empty input";
+    case ParseStatus::not_a_number:
+        return "not a whole number";
+    case ParseStatus::negative:
+        return "negative count";
+    }
+    return "unknown status";
+}
