@@ -1,0 +1,48 @@
+# Private working documents — never commit
+/decisions/
+
+# Build directories (repository root)
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+
+# Build directories inside example and exercise projects
+**/build/
+**/cmake-build-*/
+
+# Local IDE, editor and tool settings
+/.idea/
+/.vscode/
+/.vs/
+/.cache/
+/CMakeUserPresets.json
+/compile_commands.json
+
+# CMake and CTest outputs from in-source builds
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/Temporary/
+
+# Compiler and linker outputs
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Python caches (course tooling)
+__pycache__/
+*.pyc
+
+# OS and editor clutter
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
